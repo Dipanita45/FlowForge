@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+
 import {
   DndContext,
   closestCorners,
@@ -36,6 +37,32 @@ export function KanbanBoard() {
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [socket, setSocket] = useState<any>(null);
 
+  const handleEditTask = async (task: Task) => {
+  const newTitle = window.prompt("Edit title:", task.title);
+  if (!newTitle) return;
+
+  const newDescription = window.prompt(
+    "Edit description:",
+    task.description
+  );
+
+  try {
+    await fetch(
+      `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000"}/api/tasks/${task.id}/edit`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: newTitle,
+          description: newDescription,
+        }),
+      }
+    );
+  } catch (error) {
+    console.error("Failed to update task", error);
+  }
+};
+
   useEffect(() => {
     // Assuming backend runs on 5000 in dev
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
@@ -59,6 +86,10 @@ export function KanbanBoard() {
 
     newSocket.on("task-created", (newTask: Task) => {
       setTasks((prev) => [...prev, newTask].sort((a, b) => a.position - b.position));
+    });
+
+    newSocket.on("task-updated", (updatedTask: Task) => {
+      setTasks((prev) => prev.map((t) => (t.id === updatedTask.id ? updatedTask : t)));
     });
 
     newSocket.on("task-deleted", (taskId: string) => {
@@ -142,54 +173,90 @@ export function KanbanBoard() {
   };
 
   const handleDragEnd = async (event: any) => {
-    setActiveTask(null);
-    const { active, over } = event;
-    if (!over) return;
+  setActiveTask(null);
 
-    const activeId = active.id;
-    const overId = over.id;
+  const { active, over } = event;
+  if (!over) return;
 
-    const activeTask = tasks.find((t) => t.id === activeId);
-    if (!activeTask) return;
+  const activeId = active.id;
+  const overId = over.id;
 
-    let newStatus = activeTask.status;
-    
-    if (over.data.current?.type === "Column") {
-      newStatus = over.id as any;
-    } else if (over.data.current?.type === "Task") {
-      const overTask = tasks.find((t) => t.id === overId);
-      if (overTask) {
-        newStatus = overTask.status;
-      }
+  const activeTask = tasks.find((t) => t.id === activeId);
+  if (!activeTask) return;
+
+  let newStatus = activeTask.status;
+
+  if (over.data.current?.type === "Column") {
+    newStatus = over.id as any;
+  } else if (over.data.current?.type === "Task") {
+    const overTask = tasks.find((t) => t.id === overId);
+    if (overTask) {
+      newStatus = overTask.status;
     }
+  }
 
-    const activeIndex = tasks.findIndex((t) => t.id === activeId);
-    const position = activeIndex;
+  // Create updated task list
+  let updatedTasks = [...tasks];
 
-    const updatedTask = { ...activeTask, status: newStatus, position };
-    
-    const newTasksList = tasks.map(t => t.id === activeId ? updatedTask : t);
-    setTasks(newTasksList);
+  // Update dragged task status
+  updatedTasks = updatedTasks.map((task) =>
+    task.id === activeId
+      ? { ...task, status: newStatus }
+      : task
+  );
 
-    try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000"}/api/tasks/${activeId}`, {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ status: newStatus, position }),
+  // Get tasks of affected column
+  const columnTasks = updatedTasks
+    .filter((task) => task.status === newStatus)
+    .sort((a, b) => a.position - b.position);
+
+  // Reassign positions sequentially
+  const reorderedTasks = columnTasks.map((task, index) => ({
+    ...task,
+    position: index,
+  }));
+
+  // Merge back updated positions
+  updatedTasks = updatedTasks.map((task) => {
+    const updated = reorderedTasks.find((t) => t.id === task.id);
+    return updated || task;
+  });
+
+  // Update frontend state
+  setTasks(updatedTasks);
+
+  try {
+    // Send updates for all affected tasks
+    await Promise.all(
+      reorderedTasks.map((task) =>
+        fetch(
+          `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000"}/api/tasks/${task.id}`,
+          {
+            method: "PATCH",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              status: task.status,
+              position: task.position,
+            }),
+          }
+        )
+      )
+    );
+
+    // Emit socket updates
+    if (socket) {
+      reorderedTasks.forEach((task) => {
+        socket.emit("task-moved", task);
       });
-
-      if (res.ok) {
-        const savedTask = await res.json();
-        if (socket) {
-          socket.emit("task-moved", savedTask);
-        }
-      }
-    } catch (error) {
-      console.error("Failed to update task", error);
     }
-  };
+  } catch (error) {
+    console.error("Failed to update task positions", error);
+  }
+};
+
+    
 
   const handleCreateTask = async (columnId: string) => {
     const title = window.prompt("Task Title:");
@@ -245,6 +312,7 @@ export function KanbanBoard() {
             tasks={tasks.filter((task) => task.status === col.id)}
             onCreateTask={() => handleCreateTask(col.id)}
             onDeleteTask={handleDeleteTask}
+            onEditTask={handleEditTask}
           />
         ))}
       </div>
